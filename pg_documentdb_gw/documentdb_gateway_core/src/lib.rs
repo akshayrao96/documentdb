@@ -122,8 +122,9 @@ fn create_unix_socket_listener(socket_path: &str, permissions: u32) -> Result<Un
 
 /// Runs the `DocumentDB` gateway server, accepting and handling incoming connections.
 ///
-/// This function sets up a TCP listener and SSL context, then continuously accepts
-/// new connections until the cancellation token is triggered. Each connection is
+/// This function sets up a TCP listener, then continuously accepts new connections
+/// until the cancellation token is triggered. Connections are limited by a semaphore
+/// based on `max_incoming_connections` configuration. Each accepted connection is
 /// handled in a separate async task.
 ///
 /// # Arguments
@@ -211,7 +212,7 @@ where
     }
 }
 
-/// Spawns an async task to handle a TCP connection.
+/// Spawns an async task to handle a TCP connection with connection limiting.
 fn spawn_tcp_handler<T>(
     stream_and_address: std::io::Result<(TcpStream, std::net::SocketAddr)>,
     service_context: ServiceContext,
@@ -220,16 +221,40 @@ fn spawn_tcp_handler<T>(
 ) where
     T: PgDataClient,
 {
+    let (tcp_stream, addr) = match stream_and_address {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to accept {protocol} connection: {e:?}");
+            return;
+        }
+    };
+
+    let permit = match service_context.connection_semaphore().clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            let connection_count = service_context.setup_configuration().max_incoming_connections()
+                - service_context.connection_semaphore().available_permits();
+            drop(tcp_stream);
+            tracing::warn!(
+                remote = %addr,
+                connectionCount = connection_count,
+                "Connection refused because there are too many open connections"
+            );
+            return;
+        }
+    };
+
     tokio::spawn(async move {
+        let _permit = permit;
         if let Err(err) =
-            handle_connection::<T>(stream_and_address, service_context, telemetry).await
+            handle_connection::<T>(Ok((tcp_stream, addr)), service_context, telemetry).await
         {
             tracing::error!("Failed to accept a TCP connection ({protocol}): {err:?}.");
         }
     });
 }
 
-/// Spawns an async task to handle a Unix socket connection.
+/// Spawns an async task to handle a Unix socket connection with connection limiting.
 fn spawn_unix_handler<T>(
     stream_result: std::io::Result<(UnixStream, UnixSocketAddr)>,
     service_context: ServiceContext,
@@ -237,7 +262,24 @@ fn spawn_unix_handler<T>(
 ) where
     T: PgDataClient,
 {
+    let permit = match service_context.connection_semaphore().clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            let connection_count = service_context.setup_configuration().max_incoming_connections()
+                - service_context.connection_semaphore().available_permits();
+            if let Ok((stream, _)) = stream_result {
+                drop(stream);
+            }
+            tracing::warn!(
+                connectionCount = connection_count,
+                "Unix socket connection refused because there are too many open connections"
+            );
+            return;
+        }
+    };
+
     tokio::spawn(async move {
+        let _permit = permit;
         if let Err(err) =
             handle_unix_connection::<T>(stream_result, service_context, telemetry).await
         {
