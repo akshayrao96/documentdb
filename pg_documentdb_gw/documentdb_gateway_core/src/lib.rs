@@ -42,6 +42,9 @@ use tokio_openssl::SslStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
 use crate::{
     context::{ConnectionContext, ServiceContext},
     error::{DocumentDBError, Result},
@@ -163,6 +166,12 @@ where
         service_context.setup_configuration().gateway_listen_port()
     );
 
+    let max_connections = service_context
+        .setup_configuration()
+        .max_incoming_connections()
+        .min(Semaphore::MAX_PERMITS);
+    let connection_semaphore = Arc::new(Semaphore::new(max_connections));
+
     let unix_listener =
         if let Some(unix_socket_path) = service_context.setup_configuration().unix_socket_path() {
             let permissions = service_context
@@ -185,7 +194,7 @@ where
                     None => std::future::pending().await,
                 }
             }, if ipv4_listener.is_some() => {
-                spawn_tcp_handler::<T>(result, service_context.clone(), telemetry.clone(), "IPv4");
+                spawn_tcp_handler::<T>(result, service_context.clone(), telemetry.clone(), &connection_semaphore, max_connections, "IPv4");
             }
             // Handle IPv6 TCP connections
             result = async {
@@ -194,7 +203,7 @@ where
                     None => std::future::pending().await,
                 }
             }, if ipv6_listener.is_some() => {
-                spawn_tcp_handler::<T>(result, service_context.clone(), telemetry.clone(), "IPv6");
+                spawn_tcp_handler::<T>(result, service_context.clone(), telemetry.clone(), &connection_semaphore, max_connections, "IPv6");
             }
             // Handle Unix socket connections
             result = async {
@@ -203,7 +212,7 @@ where
                     None => std::future::pending().await,
                 }
             }, if unix_listener.is_some() => {
-                spawn_unix_handler::<T>(result, service_context.clone(), telemetry.clone());
+                spawn_unix_handler::<T>(result, service_context.clone(), telemetry.clone(), &connection_semaphore, max_connections);
             }
             () = token.cancelled() => {
                 return Ok(())
@@ -217,6 +226,8 @@ fn spawn_tcp_handler<T>(
     stream_and_address: std::io::Result<(TcpStream, std::net::SocketAddr)>,
     service_context: ServiceContext,
     telemetry: Option<Box<dyn TelemetryProvider>>,
+    connection_semaphore: &Arc<Semaphore>,
+    max_connections: usize,
     protocol: &'static str,
 ) where
     T: PgDataClient,
@@ -229,11 +240,10 @@ fn spawn_tcp_handler<T>(
         }
     };
 
-    let permit = match service_context.connection_semaphore().clone().try_acquire_owned() {
+    let permit = match connection_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            let connection_count = service_context.setup_configuration().max_incoming_connections()
-                - service_context.connection_semaphore().available_permits();
+            let connection_count = max_connections - connection_semaphore.available_permits();
             drop(tcp_stream);
             tracing::warn!(
                 remote = %addr,
@@ -247,7 +257,7 @@ fn spawn_tcp_handler<T>(
     tokio::spawn(async move {
         let _permit = permit;
         if let Err(err) =
-            handle_connection::<T>(Ok((tcp_stream, addr)), service_context, telemetry).await
+            handle_connection::<T>((tcp_stream, addr), service_context, telemetry).await
         {
             tracing::error!("Failed to accept a TCP connection ({protocol}): {err:?}.");
         }
@@ -259,14 +269,15 @@ fn spawn_unix_handler<T>(
     stream_result: std::io::Result<(UnixStream, UnixSocketAddr)>,
     service_context: ServiceContext,
     telemetry: Option<Box<dyn TelemetryProvider>>,
+    connection_semaphore: &Arc<Semaphore>,
+    max_connections: usize,
 ) where
     T: PgDataClient,
 {
-    let permit = match service_context.connection_semaphore().clone().try_acquire_owned() {
+    let permit = match connection_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            let connection_count = service_context.setup_configuration().max_incoming_connections()
-                - service_context.connection_semaphore().available_permits();
+            let connection_count = max_connections - connection_semaphore.available_permits();
             if let Ok((stream, _)) = stream_result {
                 drop(stream);
             }
@@ -373,7 +384,7 @@ async fn detect_tls_handshake(tcp_stream: &TcpStream, connection_id: Uuid) -> Re
 ///
 /// # Arguments
 ///
-/// * `stream_and_address` - Result containing the TCP stream and peer address from `accept()`
+/// * `stream_and_address` - The TCP stream and peer address
 /// * `service_context` - Service configuration and shared state
 /// * `telemetry` - Optional telemetry provider for metrics collection
 ///
@@ -391,15 +402,13 @@ async fn detect_tls_handshake(tcp_stream: &TcpStream, connection_id: Uuid) -> Re
 /// * Connection context creation fails
 /// * Stream buffering setup fails
 async fn handle_connection<T>(
-    stream_and_address: std::result::Result<(TcpStream, std::net::SocketAddr), std::io::Error>,
+    (tcp_stream, peer_address): (TcpStream, std::net::SocketAddr),
     service_context: ServiceContext,
     telemetry: Option<Box<dyn TelemetryProvider>>,
 ) -> Result<()>
 where
     T: PgDataClient,
 {
-    let (tcp_stream, peer_address) = stream_and_address?;
-
     let connection_id = Uuid::new_v4();
     tracing::info!(
         activity_id = connection_id.to_string().as_str(),

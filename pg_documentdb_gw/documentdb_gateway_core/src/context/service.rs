@@ -7,7 +7,6 @@
  */
 
 use std::{sync::Arc, time::Duration};
-use tokio::sync::Semaphore;
 
 use crate::{
     configuration::{DynamicConfiguration, SetupConfiguration},
@@ -27,7 +26,6 @@ pub struct ServiceContextInner {
     pub custom_pg_error_mapper: Option<Box<dyn CustomPostgresErrorMapper>>,
     pub request_metrics_enabled: bool,
     session_manager: SessionManager,
-    pub connection_semaphore: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,9 +44,6 @@ impl ServiceContext {
             .metrics()
             .metrics_enabled();
         let timeout_secs = setup_configuration.transaction_timeout_secs();
-        let max_connections = setup_configuration
-            .max_incoming_connections()
-            .min(Semaphore::MAX_PERMITS);
         let cursor_store = CursorStore::with_reaper(Arc::clone(&dynamic_configuration), true);
         let transaction_store = TransactionStore::new(Duration::from_secs(timeout_secs));
         let session_manager = SessionManager::new(
@@ -65,13 +60,8 @@ impl ServiceContext {
             custom_pg_error_mapper,
             request_metrics_enabled,
             session_manager,
-            connection_semaphore: Arc::new(Semaphore::new(max_connections)),
         };
         Self(Arc::new(inner))
-    }
-
-    pub fn connection_semaphore(&self) -> &Arc<Semaphore> {
-        &self.0.connection_semaphore
     }
 
     #[must_use]
