@@ -29,21 +29,19 @@ pub(crate) mod collections;
 #[cfg(test)]
 pub(crate) mod testing;
 
-use std::{net::IpAddr, pin::Pin};
+use std::{net::IpAddr, pin::Pin, sync::Arc};
 
 use openssl::ssl::Ssl;
 use socket2::TcpKeepalive;
 use tokio::{
     io::BufStream,
     net::{unix::SocketAddr as UnixSocketAddr, TcpStream, UnixListener, UnixStream},
+    sync::Semaphore,
     time::Duration,
 };
 use tokio_openssl::SslStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 
 use crate::{
     context::{ConnectionContext, ServiceContext},
@@ -240,21 +238,20 @@ fn spawn_tcp_handler<T>(
         }
     };
 
-    let permit = match connection_semaphore.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            let connection_count = max_connections - connection_semaphore.available_permits();
-            drop(tcp_stream);
-            tracing::warn!(
-                remote = %addr,
-                connectionCount = connection_count,
-                "Connection refused because there are too many open connections"
-            );
-            return;
-        }
+    let Ok(permit) = Arc::clone(connection_semaphore).try_acquire_owned() else {
+        let connection_count = max_connections - connection_semaphore.available_permits();
+        drop(tcp_stream);
+        tracing::warn!(
+            remote = %addr,
+            connectionCount = connection_count,
+            "Connection refused because there are too many open connections"
+        );
+        return;
     };
 
     tokio::spawn(async move {
+        // Keep the permit owned by this task so it lives for the whole connection.
+        // Removing this binding releases the semaphore slot early and breaks the limit.
         let _permit = permit;
         if let Err(err) =
             handle_connection::<T>((tcp_stream, addr), service_context, telemetry).await
@@ -274,22 +271,21 @@ fn spawn_unix_handler<T>(
 ) where
     T: PgDataClient,
 {
-    let permit = match connection_semaphore.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            let connection_count = max_connections - connection_semaphore.available_permits();
-            if let Ok((stream, _)) = stream_result {
-                drop(stream);
-            }
-            tracing::warn!(
-                connectionCount = connection_count,
-                "Unix socket connection refused because there are too many open connections"
-            );
-            return;
+    let Ok(permit) = Arc::clone(connection_semaphore).try_acquire_owned() else {
+        let connection_count = max_connections - connection_semaphore.available_permits();
+        if let Ok((stream, _)) = stream_result {
+            drop(stream);
         }
+        tracing::warn!(
+            connectionCount = connection_count,
+            "Unix socket connection refused because there are too many open connections"
+        );
+        return;
     };
 
     tokio::spawn(async move {
+        // Keep the permit owned by this task so it lives for the whole connection.
+        // Removing this binding releases the semaphore slot early and breaks the limit.
         let _permit = permit;
         if let Err(err) =
             handle_unix_connection::<T>(stream_result, service_context, telemetry).await
